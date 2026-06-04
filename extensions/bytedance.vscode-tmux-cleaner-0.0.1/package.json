@@ -1,0 +1,17 @@
+{
+  "name": "vscode-tmux-cleaner",
+  "displayName": "VSCode Tmux Cleaner",
+  "description": "Clean tmux windows and sessions when VS Code or Trae terminals close.",
+  "version": "0.0.1",
+  "publisher": "bytedance",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js"
+}
