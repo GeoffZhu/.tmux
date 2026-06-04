@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# macOS GUI 启动时可能没有 Homebrew PATH
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:${PATH:-}"
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux not found. PATH=$PATH" >&2
+  exec "${SHELL:-/bin/sh}" -l
+fi
+
+# 关键修复：
+# VS Code / Trae 如果是从 tmux 里启动的，会继承 TMUX/TMUX_PANE。
+# 这里必须清掉，否则 tmux 会误以为当前 terminal 已经在 tmux 里。
+unset TMUX
+unset TMUX_PANE
+
+cwd="${PWD:-$HOME}"
+log_file="/tmp/vscode-tmux.log"
+meta_dir="/tmp/vscode-tmux-meta"
+meta_file=""
+
+log() {
+  printf '%s pid=%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$*" >>"$log_file"
+}
+
+sanitize() {
+  local value
+  value="$(printf '%s' "$1" | LC_ALL=C tr -c 'A-Za-z0-9_-' '_')"
+  value="${value##_}"
+  value="${value%%_}"
+  printf '%s' "$value"
+}
+
+workspace="${VSCODE_TMUX_WORKSPACE:-$(basename "$cwd")}"
+workspace="$(sanitize "$workspace")"
+[ -n "$workspace" ] || workspace="workspace"
+
+# 一个 VS Code / Trae 窗口对应一个 tmux 组锚点
+vscode_key="${VSCODE_IPC_HOOK_CLI:-${VSCODE_GIT_IPC_HANDLE:-${VSCODE_PID:-$PPID}}}"
+window_hash="$(printf '%s' "$vscode_key" | cksum | awk '{print $1}')"
+
+group_session="vscode-${workspace}-${window_hash}"
+client_session="${group_session}__client_${$}"
+
+# 每次 Open in Integrated Terminal 对应一个 tmux window
+tmux_window="$(sanitize "$(basename "$cwd")")"
+[ -n "$tmux_window" ] || tmux_window="terminal"
+
+anchor_created=0
+anchor_win_id=""
+
+if ! tmux has-session -t "$group_session" 2>/dev/null; then
+  anchor_win_id="$(tmux new-session -d -P -F '#{window_id}' -s "$group_session" -n '__bootstrap__' -c "$cwd")"
+  anchor_created=1
+fi
+
+tmux new-session -d -t "$group_session" -s "$client_session" >/dev/null
+win_id="$(tmux new-window -d -P -F '#{window_id}' -t "$client_session:" -n "$tmux_window" -c "$cwd")"
+
+if [ "$anchor_created" = 1 ] && [ -n "$anchor_win_id" ]; then
+  tmux kill-window -t "$anchor_win_id" >/dev/null 2>&1 || true
+fi
+
+mkdir -p "$meta_dir"
+meta_file="$meta_dir/$$.json"
+printf '{\n  "pid": %s,\n  "groupSession": "%s",\n  "clientSession": "%s",\n  "winId": "%s",\n  "cwd": "%s"\n}\n' \
+  "$$" "$group_session" "$client_session" "$win_id" "$cwd" >"$meta_file"
+
+log "start group=$group_session client_session=$client_session win_id=$win_id cwd=$cwd"
+
+tmux set-option -t "$group_session" renumber-windows on >/dev/null 2>&1 || true
+tmux set-option -t "$client_session" renumber-windows on >/dev/null 2>&1 || true
+
+client_tty="$(tty 2>/dev/null || true)"
+monitor_pid=""
+
+# 如果你在 tmux window 里 exit，当前 VS Code terminal 也自动退出
+if [ -n "$client_tty" ]; then
+  log "client tty=$client_tty watcher=start group=$group_session client_session=$client_session"
+  # 编辑器的关闭按钮有时会直接杀掉外层进程，导致本脚本的 trap 不执行。
+  # 这里额外起一个脱离当前 tty 的 watcher，只要发现对应 tmux client 不在了，就补杀 window。
+  nohup bash -c '
+    set -Eeuo pipefail
+    log_file="$1"
+    client_tty="$2"
+    win_id="$3"
+    group_session="$4"
+    client_session="$5"
+
+    log() {
+      printf "%s pid=%s %s\n" "$(date "+%Y-%m-%d %H:%M:%S")" "$$" "$*" >>"$log_file"
+    }
+
+    log "watcher enter group=$group_session client_session=$client_session win_id=$win_id tty=$client_tty"
+
+    while tmux list-clients -F "#{client_tty}" 2>/dev/null | grep -Fxq "$client_tty"; do
+      sleep 0.5
+    done
+
+    log "watcher client gone group=$group_session client_session=$client_session win_id=$win_id tty=$client_tty"
+    tmux kill-window -t "$win_id" >/dev/null 2>&1 || true
+    tmux kill-session -t "$client_session" >/dev/null 2>&1 || true
+    log "watcher cleanup done group=$group_session client_session=$client_session win_id=$win_id"
+  ' _ "$log_file" "$client_tty" "$win_id" "$group_session" "$client_session" >/dev/null 2>&1 &
+
+  (
+    while tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -Fxq "$win_id"; do
+      sleep 0.5
+    done
+
+    log "window gone detach-client tty=$client_tty group=$group_session client_session=$client_session win_id=$win_id"
+    tmux detach-client -t "$client_tty" >/dev/null 2>&1 || true
+  ) &
+  monitor_pid="$!"
+fi
+
+cleaned=0
+cleanup() {
+  [ "$cleaned" = 1 ] && return
+  cleaned=1
+  log "cleanup enter group=$group_session client_session=$client_session win_id=$win_id tty=${client_tty:-}"
+
+  if [ -n "${monitor_pid:-}" ]; then
+    kill "$monitor_pid" >/dev/null 2>&1 || true
+  fi
+
+  # 关闭 VS Code terminal tab 时，关闭对应的 tmux window
+  tmux kill-window -t "$win_id" >/dev/null 2>&1 || true
+  tmux kill-session -t "$client_session" >/dev/null 2>&1 || true
+  [ -n "$meta_file" ] && rm -f "$meta_file"
+  log "cleanup done group=$group_session client_session=$client_session win_id=$win_id"
+}
+
+trap cleanup EXIT
+trap 'cleanup; exit 143' HUP TERM
+trap 'cleanup; exit 130' INT
+
+set +e
+tmux attach-session -t "$client_session" \; select-window -t "$win_id"
+status=$?
+set -e
+log "attach exit status=$status group=$group_session client_session=$client_session win_id=$win_id"
+
+cleanup
+trap - EXIT HUP TERM INT
+exit "$status"
